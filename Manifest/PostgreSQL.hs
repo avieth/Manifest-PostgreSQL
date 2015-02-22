@@ -158,11 +158,13 @@ instance Manifest PostgreSQL where
           (Right <$> (query conn queryString (Only binaryKey) :: IO [Vect BS.ByteString n]))
           (catchQueryErrors)
       case rows of
-        Left failure -> lift $ throwE failure
-        Right [] -> return Nothing
-        Right [x] -> return $ Just x
-        Right (x : _) -> return $ Just x
+        Right [] -> return $ Right Nothing
+        Right [x] -> return $ Right (Just x)
+        Right (x : _) -> return $ Right (Just x)
         -- ^ TBD print warning here??
+        Left failure -> case failure of
+          PostgreSQLManifestReadFailure -> return $ Left ()
+          _ -> lift $ throwE failure
 
     where
 
@@ -219,20 +221,36 @@ instance Manifest PostgreSQL where
       catchExecuteErrors :: PostgreSQLManifestFailure -> IO (Either PostgreSQLManifestFailure a)
       catchExecuteErrors = return . Left
 
-  manifestDelete proxy key = do
+  manifestDelete proxy proxy' key = do
       (conn, tableName) <- ask
-      let queryString = fromString (B8.unpack (BS.concat ["DELETE FROM ", tableName, " WHERE key=?"]))
+      let readAction = runReaderT (manifestRead proxy proxy' key) (conn, tableName)
+      readOutcome <- lift $ catchE readAction catchReadFailure
+      -- ^ We must first try to grab the data so we can return it!
+      let deleteQuery = fromString (B8.unpack (BS.concat ["DELETE FROM ", tableName, " WHERE key=?"]))
       let binaryKey = Binary key
       result <- liftIO $
           catchJust
           (executeErrorSelector)
-          (Right <$> execute conn queryString (Only binaryKey))
+          (Right <$> execute conn deleteQuery (Only binaryKey))
           (catchExecuteErrors)
       case result of
+        Right _ -> case readOutcome of
+          Right Nothing -> return $ Right Nothing
+          -- ^ Key not found.
+          Right (Just x) -> return $ Right (Just x)
+          -- ^ Key found, value recovered.
+          Left () -> return $ Left ()
+          -- ^ Key found, value not recovered.
+          --   OR
+          --   Some other problem; just dump it to Left ()
+          --   TODO translate to a throwE? Requires putting more info into
+          --   the catchReadFailure value.
         Left failure -> lift $ throwE failure
-        Right _ -> return ()
 
     where
+
+      catchReadFailure :: PostgreSQLManifestFailure -> ExceptT PostgreSQLManifestFailure IO (Either () (Maybe (Vect BS.ByteString n)))
+      catchReadFailure x = return $ Left ()
 
       executeErrorSelector :: SomeException -> Maybe PostgreSQLManifestFailure
       executeErrorSelector e =
